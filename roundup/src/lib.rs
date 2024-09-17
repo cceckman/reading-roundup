@@ -2,11 +2,12 @@ use chrono::NaiveDate;
 use http::Uri;
 use markdown::mdast::Node;
 use regex_lite::Regex;
-use rusqlite::{named_params, params};
+use rusqlite::named_params;
 use std::{
     ffi::OsStr,
     fs::{read_dir, File},
     io::{BufRead, BufReader},
+    ops::Deref,
     path::{Path, PathBuf},
     sync::LazyLock,
     vec,
@@ -58,6 +59,31 @@ fn find_url(node: &Node) -> Option<Uri> {
     None
 }
 
+/// Scan a provided string for the link.
+pub fn scan_body<S: AsRef<str>>(
+    date: NaiveDate,
+    s: S,
+) -> Result<ReadingListEntry, RoundupErrorKind> {
+    let parseopts = markdown::ParseOptions {
+        constructs: markdown::Constructs {
+            autolink: true,
+            ..markdown::Constructs::default()
+        },
+        ..markdown::ParseOptions::default()
+    };
+    let body_ast = markdown::to_mdast(s.as_ref(), &parseopts)
+        .map_err(|_err| RoundupErrorKind::MarkdownError(s.as_ref().to_owned()))?;
+    let url =
+        find_url(&body_ast).ok_or_else(|| RoundupErrorKind::MissingLink(s.as_ref().to_owned()))?;
+    Ok(ReadingListEntry {
+        url,
+        body_text: s.as_ref().to_owned(),
+        original_text: s.as_ref().to_owned(),
+        source_date: date,
+        read: None,
+    })
+}
+
 /// Scan the file at the given path and find any reading-list entries in it.
 pub fn scan_file(file: &Path) -> Result<Vec<ReadingListEntry>, RoundupErrorKind> {
     let stem = file.file_stem().and_then(OsStr::to_str).ok_or_else(|| {
@@ -66,14 +92,6 @@ pub fn scan_file(file: &Path) -> Result<Vec<ReadingListEntry>, RoundupErrorKind>
     let source_date: NaiveDate = stem
         .parse()
         .map_err(|_| RoundupErrorKind::InvalidFile("file stem is not YYYY-MM-DD"))?;
-
-    let parseopts = markdown::ParseOptions {
-        constructs: markdown::Constructs {
-            autolink: true,
-            ..markdown::Constructs::default()
-        },
-        ..markdown::ParseOptions::default()
-    };
 
     let f = BufReader::new(File::open(file)?);
     let mut entries = Vec::new();
@@ -92,18 +110,10 @@ pub fn scan_file(file: &Path) -> Result<Vec<ReadingListEntry>, RoundupErrorKind>
                 "tbr" => Some(false),
                 _ => None,
             };
-
-            let body_ast = markdown::to_mdast(body.as_str(), &parseopts)
-                .map_err(|_err| RoundupErrorKind::MarkdownError(line.clone()))?;
-            let url =
-                find_url(&body_ast).ok_or_else(|| RoundupErrorKind::MissingLink(line.clone()))?;
-            entries.push(ReadingListEntry {
-                url,
-                body_text: body.as_str().to_owned(),
-                original_text: line.clone(),
-                source_date,
-                read,
-            })
+            let mut entry = scan_body(source_date, body.as_str())?;
+            entry.original_text = line.clone();
+            entry.read = read;
+            entries.push(entry);
         }
     }
 
@@ -164,10 +174,12 @@ pub fn scan_files(dir: &Path) -> (Vec<ReadingListEntry>, Vec<RoundupError>) {
 
 /// Insert the entries into the database.
 /// Returns the total number of links in the database.
-pub fn insert(entries: &[ReadingListEntry], db: &Path) -> rusqlite::Result<usize> {
-    let mut db = rusqlite::Connection::open(db)?;
-    let tx = db.transaction()?;
-    let mut q = tx.prepare_cached(
+pub fn insert<'a, I, T>(entries: I, db: &mut T) -> rusqlite::Result<usize>
+where
+    I: Iterator<Item = &'a ReadingListEntry>,
+    T: Deref<Target = rusqlite::Connection>,
+{
+    let mut q = db.prepare_cached(
         r#"
 INSERT INTO reading_list
         ( url,  source_date,  original_text,  body_text,  read )
@@ -183,10 +195,8 @@ ON CONFLICT (url) DO NOTHING;"#,
             ":read": entry.read,
         })?;
     }
-    drop(q);
-    tx.commit()?;
 
-    db.query_row("SELECT COUNT(*) FROM reading_list;", params![], |v| {
+    db.query_row("SELECT COUNT(*) FROM reading_list;", named_params![], |v| {
         v.get(0)
     })
 }

@@ -1,10 +1,10 @@
 // TODO:
-// - Link at the top to the "roundups" page
-// - post handler for each roundup; save / update
 // - Javascript to auto-save?
 
 use std::{
     collections::HashMap,
+    io::{Cursor, Write},
+    path::PathBuf,
     str::FromStr,
     sync::{Arc, Mutex},
 };
@@ -12,7 +12,7 @@ use std::{
 use axum::{
     extract::{OriginalUri, Path, State},
     http::{
-        header::{CONTENT_TYPE, LOCATION},
+        header::{CONTENT_DISPOSITION, CONTENT_TYPE, LOCATION},
         uri::PathAndQuery,
         StatusCode, Uri,
     },
@@ -23,20 +23,36 @@ use axum_extra::extract::Form;
 use chrono::NaiveDate;
 use maud::PreEscaped;
 use reading_roundup_data::ReadingListEntry;
+use roundup::scan_files;
 use rusqlite::{named_params, Connection};
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     #[error("error in performing SQL query: {0}")]
     SqlError(#[from] rusqlite::Error),
+    #[error("error in performing I/O query: {0}")]
+    IoError(#[from] std::io::Error),
+    #[error("error in scanning body: {0}")]
+    ScanningError(#[from] roundup::RoundupErrorKind),
 }
 
-pub fn serve(db: &std::path::Path) -> Result<axum::Router, Error> {
+pub fn serve<P: AsRef<std::path::Path>>(db: P, sources: P) -> Result<axum::Router, Error> {
     let conn = Connection::open(db)?;
-    let s = Arc::new(Mutex::new(Server { conn }));
+    let s = Arc::new(Mutex::new(Server {
+        conn,
+        sources: sources.as_ref().to_owned(),
+    }));
     Ok(axum::Router::new()
+        .route(
+            "/",
+            get(|| async { (StatusCode::FOUND, [(LOCATION, "roundups/")]) }),
+        )
+        .route("/update/", get(update))
         .route("/roundups/:date/", get(render_roundup).post(update_roundup))
+        .route("/roundups/:date/md", get(render_roundup_md))
         .route("/roundups/", get(list_roundups).post(create_roundup))
+        .route("/roundups/by-article/:id/", get(list_roundups_by_article))
+        .route("/articles/", get(list_articles).post(create_article))
         .route("/articles/:id/", get(render_article).post(update_article))
         .route("/style.css", get(css))
         .with_state(s))
@@ -44,6 +60,7 @@ pub fn serve(db: &std::path::Path) -> Result<axum::Router, Error> {
 
 struct Server {
     conn: rusqlite::Connection,
+    sources: PathBuf,
 }
 
 struct RoundupRow {
@@ -52,6 +69,52 @@ struct RoundupRow {
     count: isize,
     html: String,
     entry: ReadingListEntry,
+}
+
+async fn update(State(s): State<Arc<Mutex<Server>>>) -> impl IntoResponse {
+    let dir = { s.lock().unwrap().sources.clone() };
+    let (entries, errors) = scan_files(&dir);
+    let mut s = s.lock().unwrap();
+    let mut count_pre: isize = 0;
+    let mut count_post: isize = 0;
+    let tx_done: rusqlite::Result<()> = (|| {
+        let mut tx = s.conn.transaction()?;
+        count_pre = tx.query_row(
+            "SELECT COUNT(url) FROM reading_list",
+            named_params! {},
+            |r| r.get(0),
+        )?;
+        roundup::insert(entries.iter(), &mut tx)?;
+        count_post = tx.query_row(
+            "SELECT COUNT(url) FROM reading_list",
+            named_params! {},
+            |r| r.get(0),
+        )?;
+        tx.commit()?;
+        Ok(())
+    })();
+    let html = maud::html!(
+        head { link rel="stylesheet" href="/style.css"; }
+        body { (nav(1)) main {
+            h2 { "Update results" }
+            h3 { "Scanning report" }
+            p { (format!("{} links found, with {} errors", entries.len(), errors.len())) }
+            @for error in &errors {
+                p class="error scan-error" { (format!("{error}")) }
+            }
+            h3 { "Databse report" }
+            @match tx_done {
+                Ok(_) => { p { (format!("Update results: {} before, new total {}", count_pre, count_post)) } }
+                Err(ref e) => { p class="error db-error" { (format!("Database error: {e}")) } }
+            }
+        } }
+    );
+    let code = if tx_done.is_err() || !errors.is_empty() {
+        StatusCode::INTERNAL_SERVER_ERROR
+    } else {
+        StatusCode::OK
+    };
+    (code, html).into_response()
 }
 
 fn destruct_roundup_row(row: &rusqlite::Row) -> rusqlite::Result<RoundupRow> {
@@ -90,7 +153,6 @@ async fn css() -> impl IntoResponse {
 async fn render_roundup(
     State(server): State<Arc<Mutex<Server>>>,
     Path(p): Path<String>,
-    // TODO: support "get as YAML" too
 ) -> impl IntoResponse {
     let date: NaiveDate = match p.parse() {
         Ok(v) => v,
@@ -114,9 +176,63 @@ async fn render_roundup(
     }
 }
 
+/// Render the editor for a roundup post.
+async fn render_roundup_md(
+    State(server): State<Arc<Mutex<Server>>>,
+    Path(p): Path<String>,
+) -> impl IntoResponse {
+    let date: NaiveDate = match p.parse() {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "reading roundups are identified by date",
+            )
+                .into_response()
+        }
+    };
+
+    let mut server = server.lock().unwrap();
+    match server.render_roundup_md(date) {
+        Ok(v) => v.into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("unexpected error: {e}"),
+        )
+            .into_response(),
+    }
+}
+
 async fn list_roundups(State(server): State<Arc<Mutex<Server>>>) -> impl IntoResponse {
     let mut server = server.lock().unwrap();
-    match server.list_roundups(None) {
+    match server.list_roundups() {
+        Ok(v) => v.into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("unexpected error: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+async fn list_roundups_by_article(
+    State(server): State<Arc<Mutex<Server>>>,
+    Path(id): Path<isize>,
+) -> impl IntoResponse {
+    let mut server = server.lock().unwrap();
+    match server.list_roundups_by_article(id) {
+        Ok(v) => v.into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("unexpected error: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+async fn list_articles(State(server): State<Arc<Mutex<Server>>>) -> impl IntoResponse {
+    let mut server = server.lock().unwrap();
+    match server.list_articles() {
         Ok(v) => v.into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -130,10 +246,29 @@ async fn list_roundups(State(server): State<Arc<Mutex<Server>>>) -> impl IntoRes
 async fn render_article(
     State(server): State<Arc<Mutex<Server>>>,
     Path(p): Path<isize>,
-    // TODO: support "get as YAML" too
 ) -> impl IntoResponse {
     let mut server = server.lock().unwrap();
     match server.render_article(p) {
+        Ok(v) => v.into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("unexpected error: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+async fn create_article(
+    State(server): State<Arc<Mutex<Server>>>,
+    Form(form): Form<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let body = match form.get("text") {
+        Some(v) => v,
+        None => return (StatusCode::BAD_REQUEST, "missing text for new article").into_response(),
+    };
+
+    let mut server = server.lock().unwrap();
+    match server.create_article(body) {
         Ok(v) => v.into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -184,7 +319,7 @@ async fn update_roundup(
     };
     let articles = form
         .get("article-included")
-        .map(Clone::clone)
+        .cloned()
         .unwrap_or_else(Vec::new);
 
     let mut server = server.lock().unwrap();
@@ -228,12 +363,17 @@ async fn create_roundup(
         .into_response()
 }
 
-fn nav(individual: bool) -> PreEscaped<String> {
-    let path = if individual { "../.." } else { ".." };
+fn nav(depth: usize) -> PreEscaped<String> {
+    let mut prefix = PathBuf::new();
+    for _ in 0..depth {
+        prefix.push("..");
+    }
+    let prefix = prefix.display();
     maud::html!(
         nav { ul class="menu" {
-            li { a href=(format!("{path}/roundups/")) { "Roundups" } }
-            /* li { a href=(format!("{path}/articles/")) { "Articles" } } */
+            li { a href=(format!("{prefix}/roundups/")) { "Roundups" } }
+            li { a href=(format!("{prefix}/articles/")) { "Articles" } }
+            li { a href=(format!("{prefix}/update/")) { "Update" } }
         } }
     )
 }
@@ -261,6 +401,21 @@ impl Server {
         Ok((StatusCode::SEE_OTHER, [(LOCATION, uri.to_string())]))
     }
 
+    fn create_article(&mut self, new_body: &str) -> Result<impl IntoResponse, Error> {
+        let now: chrono::NaiveDate = chrono::Local::now().date_naive();
+        let entry: ReadingListEntry = roundup::scan_body(now, new_body)?;
+        let mut tx = self.conn.transaction()?;
+        roundup::insert([&entry].into_iter(), &mut tx)?;
+        tx.commit()?;
+        let id: isize = self.conn.query_row(
+            "SELECT id FROM reading_list WHERE url = :url",
+            named_params! {":url": entry.url.to_string()},
+            |row| row.get(0),
+        )?;
+
+        Ok((StatusCode::SEE_OTHER, [(LOCATION, format!("{id}/"))]))
+    }
+
     fn update_article(
         &mut self,
         id: isize,
@@ -279,11 +434,7 @@ impl Server {
             .execute(named_params! {":id" : id, ":body_text" : new_body, ":read": read_state})?;
         Ok((StatusCode::SEE_OTHER, [(LOCATION, uri.to_string())]))
     }
-    fn render_article(
-        &mut self,
-        id: isize,
-        // TODO: support "get as YAML" too
-    ) -> Result<impl IntoResponse, Error> {
+    fn render_article(&mut self, id: isize) -> Result<impl IntoResponse, Error> {
         // Query everything, prioritizing stuff in the roundup.
         let (count, entry) = self
             .conn
@@ -305,7 +456,7 @@ impl Server {
         Ok(maud::html! {
             head { link rel="stylesheet" href="/style.css"; }
             body {
-                (nav(true))
+                (nav(2))
                 main {
                 div class="summary" {
                     h3 {
@@ -313,18 +464,18 @@ impl Server {
                     }
                     h4 class="tile-title" {
                         p { (entry.source_date) }
-                        p { (format!("{count} roundups")) }
+                        p { a href=(format!("../../roundups/by-article/{id}/")) { (format!("{count} roundups")) } }
                     }
                 }
                 form action="" method="POST" {
                     div class="controls" {
-                        button label="Save" type="submit" { "Save" }
                         span {
                             input type="radio" value="tbr" id="tbr" name="read" checked?[tbr];
                             label for="tbr" { "TBR" }
                             input type="radio" value="read" id="tbr" name="read" checked?[read];
                             label for="read" { "Read" }
                         }
+                        button label="Save" type="submit" { "Save" }
                     }
                     details { summary { "Original" } pre { (entry.original_text) } }
                     details open {
@@ -339,26 +490,96 @@ impl Server {
         })
     }
 
-    /// List the roundups. If with_article is provided, filter to just those that have the article
-    /// present.
-    fn list_roundups(&mut self, with_article: Option<isize>) -> Result<impl IntoResponse, Error> {
-        let rows : Result<Vec<String>, _> = match with_article {
-            None => self.conn.prepare("SELECT DISTINCT date FROM roundup_contents ORDER BY date ASC")?.query_map(named_params! {}, |row| row.get("date"))?.collect(),
-            Some(id) => self.conn.prepare("SELECT DISTINCT date FROM roundup_contents WHERE entry = :id ORDER BY date ASC")?.query_map(named_params! {":id": id}, |row| row.get("date"))?.collect()
-        };
+    /// List all articles.
+    fn list_articles(&mut self) -> Result<impl IntoResponse, Error> {
+        let rows : Result<Vec<_>, _> = self.conn.prepare(r#"
+            SELECT *
+            FROM reading_list
+            LEFT JOIN
+                (SELECT entry, COUNT(DISTINCT date) as count, 1 as included FROM roundup_contents GROUP BY entry)
+                ON reading_list.id = entry
+            ORDER BY count ASC, source_date ASC
+            "#)?.query_map(named_params! {}, destruct_roundup_row)?.collect();
+        let entries = rows?;
+
+        fn render_row(row: &RoundupRow) -> PreEscaped<String> {
+            let unread_sigil = match row.entry.read {
+                None => "?",
+                Some(true) => "📖",
+                Some(false) => "📕",
+            };
+            maud::html!( tr {
+                    td { (maud::PreEscaped(row.html.clone())) }
+                    td { a href=(format!("../roundups/by-article/{}/", row.id)) { (row.count) } }
+                    td { (unread_sigil) }
+                    td { (format!("{}", row.entry.source_date)) }
+                    td { a href=(format!("/articles/{}/", row.id)) { (maud::PreEscaped("&nbsp;🖉&nbsp;")) } }
+                }
+            )
+        }
+        Ok(maud::html! {
+            head { link rel="stylesheet" href="/style.css"; }
+            body {
+                (nav(1))
+                main {
+                form method="post" { h3 class="tile-title" {
+                    textarea name="text" class="narrow" {  }
+                    button type="submit" { "Add article" }
+                } }
+
+                table { @for entry in entries { (render_row(&entry)) } }
+                }
+            }
+        })
+    }
+
+    /// List the roundups that contain a particular article.
+    fn list_roundups_by_article(&mut self, id: isize) -> Result<impl IntoResponse, Error> {
+        let rows: Result<Vec<String>, _> = self
+            .conn
+            .prepare(
+                "SELECT DISTINCT date FROM roundup_contents WHERE entry = :id ORDER BY date ASC",
+            )?
+            .query_map(named_params! {":id": id}, |row| row.get("date"))?
+            .collect();
+        let rows = rows?;
+
+        Ok(maud::html! {
+        head { link rel="stylesheet" href="/style.css"; }
+        body {
+            (nav(1))
+            main {
+                p { "Roundups including " a href=(format!("../../../articles/{id}/")) { "article " (id) }}
+                @for date in rows {
+                    div class="summary" {
+                        h3 {
+                            a href=(format!("../../{date}/")) { (date) }
+                        }
+                    }
+                }
+            }
+        } })
+    }
+
+    /// List all roundups.
+    fn list_roundups(&mut self) -> Result<impl IntoResponse, Error> {
+        let rows: Result<Vec<String>, _> = self
+            .conn
+            .prepare("SELECT DISTINCT date FROM roundup_contents ORDER BY date ASC")?
+            .query_map(named_params! {}, |row| row.get("date"))?
+            .collect();
         let rows = rows?;
 
         Ok(maud::html! {
             head { link rel="stylesheet" href="/style.css"; }
             body {
-                (nav(false))
+                (nav(1))
                 main {
                 form method="POST" class="summary" {
                     label for="new-roundup" { "Start a new roundup: " }
                     input type="date" id="new-roundup" name="new-roundup";
                     button type="submit" { "Go!" }
-                }
-                @for date in rows {
+                }                @for date in rows {
                 div class="summary" {
                     h3 {
                         a href=(format!("{date}/")) { (date) }
@@ -369,11 +590,49 @@ impl Server {
         })
     }
 
-    fn render_roundup(
-        &mut self,
-        date: NaiveDate,
-        // TODO: support "get as YAML" too
-    ) -> Result<impl IntoResponse, Error> {
+    fn render_roundup_md(&mut self, date: NaiveDate) -> Result<impl IntoResponse, Error> {
+        let date_str = format!("{date}");
+        let rows: Result<Vec<_>, _> = self
+            .conn
+            .prepare(
+                r#"
+            SELECT reading_list.body_text
+            FROM roundup_contents LEFT JOIN reading_list ON reading_list.id = roundup_contents.entry
+            WHERE roundup_contents.date = :date
+            "#,
+            )?
+            .query_map(named_params! {":date": &date_str}, |row| row.get(0))?
+            .collect();
+        let bodies: Vec<String> = rows?;
+        let mut s = Cursor::new(Vec::<u8>::new());
+        write!(
+            s,
+            r#"---
+title: "Reading Roundup, {date_str}"
+date: {date_str}
+---
+
+"#
+        )?;
+        for body in bodies {
+            writeln!(s, "{body}")?;
+            // Additional newline as paragraph break
+            writeln!(s)?;
+        }
+        Ok((
+            StatusCode::OK,
+            [
+                (CONTENT_TYPE, "text/markdown; charset=UTF-8".to_owned()),
+                (
+                    CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"{date}.md\""),
+                ),
+            ],
+            s.into_inner(),
+        ))
+    }
+
+    fn render_roundup(&mut self, date: NaiveDate) -> Result<impl IntoResponse, Error> {
         // Query everything, prioritizing stuff in the roundup.
         let rows: Result<Vec<_>, _> = self
             .conn
@@ -402,7 +661,7 @@ impl Server {
             let unread = !row.entry.read.unwrap_or(false);
             maud::html!( tr {
                     td { (maud::PreEscaped(row.html.clone())) }
-                    td { (row.count) }
+                    td { a href=(format!("../by-article/{}/", row.id)) { (row.count) } }
                     td { input type="checkbox" name="article-included" value=(row.id) checked?[row.included] disabled?[unread]; }
                     td { (format!("{}", row.entry.source_date)) }
                     td { a href=(format!("/articles/{}/", row.id)) { (maud::PreEscaped("&nbsp;🖉&nbsp;")) } }
@@ -413,11 +672,12 @@ impl Server {
         Ok(maud::html! {
             head { link rel="stylesheet" href="/style.css"; }
             body {
-                (nav(true))
+                (nav(2))
                 main { form method="POST" {
                     div class="summary" {
                         h3 class="tile-title" {
-                            a { (format!("Reading Roundup, {date}")) }
+                            (format!("Reading Roundup, {date}"))
+                            a href="md" { "Download" }
                             button label="Save" type="submit" { "Save" }
                          }
 

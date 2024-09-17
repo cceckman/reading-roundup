@@ -16,6 +16,7 @@ fn main() {
         std::process::exit(1);
     }
 
-    let n = roundup::insert(&ok, &to).unwrap();
+    let mut conn = rusqlite::Connection::open(&to);
+    let n = roundup::insert(&ok, &mut conn).unwrap();
     eprintln!("{n} links in the database");
 }
