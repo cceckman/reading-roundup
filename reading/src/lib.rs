@@ -7,6 +7,7 @@ use axum::{
     routing::get,
 };
 use chrono::NaiveDate;
+use reading_roundup_data::ReadingListEntry;
 use rusqlite::{named_params, Connection};
 
 #[derive(thiserror::Error, Debug)]
@@ -31,7 +32,7 @@ struct RoundupRow {
     id: isize,
     included: bool,
     html: String,
-    //entry: ReadingListEntry,
+    entry: ReadingListEntry,
 }
 
 fn destruct_row(row: &rusqlite::Row) -> rusqlite::Result<RoundupRow> {
@@ -41,13 +42,13 @@ fn destruct_row(row: &rusqlite::Row) -> rusqlite::Result<RoundupRow> {
         id: row.get("id")?,
         included,
         html,
-        //entry: ReadingListEntry {
-        //    url: row.get::<_, String>("url")?.parse().unwrap(),
-        //    source_date: row.get::<_, String>("source_date")?.parse().unwrap(),
-        //    original_text: row.get::<_, String>("original_text")?.to_owned(),
-        //    body_text: row.get::<_, String>("body_text")?.to_owned(),
-        //    read: row.get("read")?,
-        //},
+        entry: ReadingListEntry {
+            url: row.get::<_, String>("url")?.parse().unwrap(),
+            source_date: row.get::<_, String>("source_date")?.parse().unwrap(),
+            original_text: row.get::<_, String>("original_text")?.to_owned(),
+            body_text: row.get::<_, String>("body_text")?.to_owned(),
+            read: row.get("read")?,
+        },
     })
 }
 
@@ -95,7 +96,7 @@ impl Server {
             LEFT JOIN
                 (SELECT entry, 1 as included FROM roundup_contents WHERE date = :date)
                 ON reading_list.id = entry
-            ORDER BY included DESC
+            ORDER BY included DESC, source_date DESC
             "#,
             )?
             .query_map(named_params! {":date": format!("{date}")}, destruct_row)?
@@ -107,6 +108,8 @@ impl Server {
             form { table {
                 @for row in rows { tr {
                     td { input type="checkbox" name=(format!("included-{}", row.id)) checked?[row.included] ; }
+                    td { (format!("{}", row.entry.source_date)) }
+                    td { a href=(format!("/article/{}/", row.id)) { (maud::PreEscaped("&nbsp;🖉&nbsp;")) } }
                     td { (maud::PreEscaped(row.html)) }
                 } }
             } }
