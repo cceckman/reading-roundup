@@ -28,6 +28,7 @@ pub fn serve(db: &std::path::Path) -> Result<axum::Router, Error> {
     let s = Arc::new(Mutex::new(Server { conn }));
     Ok(axum::Router::new()
         .route("/roundups/:date/", get(render_roundup))
+        .route("/roundups/", get(list_roundups))
         .route("/articles/:id/", get(render_article).post(update_article))
         .route("/style.css", get(css))
         .with_state(s))
@@ -93,6 +94,18 @@ async fn render_roundup(
 
     let mut server = server.lock().unwrap();
     match server.render_roundup(date) {
+        Ok(v) => v.into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("unexpected error: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+async fn list_roundups(State(server): State<Arc<Mutex<Server>>>) -> impl IntoResponse {
+    let mut server = server.lock().unwrap();
+    match server.list_roundups(None) {
         Ok(v) => v.into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -203,6 +216,34 @@ impl Server {
                         }
                     }
                     textarea name="body_text" { (entry.body_text) }
+                }
+            } }
+        })
+    }
+
+    /// List the roundups. If with_article is provided, filter to just those that have the article
+    /// present.
+    fn list_roundups(&mut self, with_article: Option<isize>) -> Result<impl IntoResponse, Error> {
+        let rows : Result<Vec<String>, _> = match with_article {
+            None => self.conn.prepare("SELECT DISTINCT date FROM roundup_contents ORDER BY date ASC")?.query_map(named_params! {}, |row| row.get("date"))?.collect(),
+            Some(id) => self.conn.prepare("SELECT DISTINCT date FROM roundup_contents WHERE entry = :id ORDER BY date ASC")?.query_map(named_params! {":id": id}, |row| row.get("date"))?.collect()
+        };
+        let rows = rows?;
+
+        Ok(maud::html! {
+            head { link rel="stylesheet" href="/style.css"; }
+            body { main {
+                form method="POST" class="summary" {
+                    label for="new-roundup" { "Start a new roundup: " }
+                    input type="date" id="new-roundup" name="new-roundup";
+                    button type="submit" { "Go!" }
+                }
+                @for date in rows {
+                div class="summary" {
+                    h3 {
+                        a href=(format!("{date}/")) { (date) }
+                    }
+                }
                 }
             } }
         })
