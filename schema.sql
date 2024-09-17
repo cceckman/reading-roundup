@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS reading_list
 CREATE TABLE IF NOT EXISTS roundup_contents
 (   date    TEXT    NOT NULL    DEFAULT (date('now'))
 ,   entry   INTEGER
+    -- No order here; allow re-ordering when we flush to Markdown.
 ,   FOREIGN KEY (entry) REFERENCES reading_list(id)
 ,   PRIMARY KEY (date, entry)
 );
