@@ -5,7 +5,6 @@ use regex_lite::Regex;
 use rusqlite::{named_params, params};
 use std::{
     ffi::OsStr,
-    fmt::Display,
     fs::{read_dir, File},
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
@@ -13,6 +12,8 @@ use std::{
     vec,
 };
 use thiserror::Error;
+
+pub use reading_roundup_data::ReadingListEntry;
 
 static ENTRY_REGEX: std::sync::LazyLock<Regex> = LazyLock::new(|| {
     Regex::new("^.*#(reading|read|tbr)[ :]*(.*)$").expect("invalid regex provided")
@@ -38,26 +39,6 @@ pub enum RoundupErrorKind {
     MarkdownError(String),
     #[error("no valid link found in body: {0}")]
     MissingLink(String),
-}
-
-/// Entry in or for the reading-list database.
-#[derive(Debug)]
-pub struct ReadingListEntry {
-    pub url: Uri,
-    pub original_text: String,
-    pub body_text: String,
-    pub source_date: chrono::NaiveDate,
-    pub read: Option<bool>,
-}
-
-impl Display for ReadingListEntry {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}: {} -- {}",
-            self.source_date, self.url, self.body_text
-        )
-    }
 }
 
 /// Recursive visitor to search for a URI.

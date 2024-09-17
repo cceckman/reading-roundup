@@ -1,0 +1,8 @@
+[package]
+name = "reading_roundup_data"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+chrono = { version = "0.4.38", default-features = false }
+http = "1.1.0"
