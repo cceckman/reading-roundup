@@ -1,10 +1,17 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use axum::{
-    extract::{Path, State},
-    http::{header::CONTENT_TYPE, StatusCode},
+    extract::{OriginalUri, Path, State},
+    http::{
+        header::{CONTENT_TYPE, LOCATION},
+        StatusCode, Uri,
+    },
     response::IntoResponse,
     routing::get,
+    Form,
 };
 use chrono::NaiveDate;
 use reading_roundup_data::ReadingListEntry;
@@ -21,7 +28,7 @@ pub fn serve(db: &std::path::Path) -> Result<axum::Router, Error> {
     let s = Arc::new(Mutex::new(Server { conn }));
     Ok(axum::Router::new()
         .route("/roundups/:date/", get(render_roundup))
-        .route("/articles/:id/", get(render_article))
+        .route("/articles/:id/", get(render_article).post(update_article))
         .route("/style.css", get(css))
         .with_state(s))
 }
@@ -112,7 +119,47 @@ async fn render_article(
     }
 }
 
+async fn update_article(
+    State(server): State<Arc<Mutex<Server>>>,
+    Path(id): Path<isize>,
+    OriginalUri(uri): OriginalUri,
+    Form(form): Form<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let body = match form.get("body_text") {
+        Some(v) => v,
+        None => return (StatusCode::BAD_REQUEST, "missing body_text for update").into_response(),
+    };
+    // TODO:"have read" via UI as well
+
+    let mut server = server.lock().unwrap();
+    match server.update_article(id, uri, body) {
+        Ok(v) => v.into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("unexpected error: {e}"),
+        )
+            .into_response(),
+    }
+}
+
 impl Server {
+    fn update_article(
+        &mut self,
+        id: isize,
+        uri: Uri,
+        new_body: &str,
+    ) -> Result<impl IntoResponse, Error> {
+        self.conn
+            .prepare(
+                r#"
+            UPDATE reading_list
+            SET body_text = :body_text
+            WHERE id = :id
+        "#,
+            )?
+            .execute(named_params! {":id" : id, ":body_text" : new_body})?;
+        Ok((StatusCode::SEE_OTHER, [(LOCATION, uri.to_string())]))
+    }
     fn render_article(
         &mut self,
         id: isize,
@@ -146,8 +193,8 @@ impl Server {
                         p { (format!("{count} roundups")) }
                     }
                 }
-                form {
-                    button label="Save" action="submit" { "Save" }
+                form action="" method="POST" {
+                    button label="Save" type="submit" { "Save" }
                     details { summary { "Original" } pre { (entry.original_text) } }
                     details open {
                         summary { "Preview" }
@@ -155,7 +202,7 @@ impl Server {
                             (maud::PreEscaped(markdown::to_html(&entry.body_text)))
                         }
                     }
-                    textarea { (entry.body_text) }
+                    textarea name="body_text" { (entry.body_text) }
                 }
             } }
         })
