@@ -2,6 +2,7 @@ use chrono::NaiveDate;
 use http::Uri;
 use markdown::mdast::Node;
 use regex_lite::Regex;
+use rusqlite::{named_params, params};
 use std::{
     ffi::OsStr,
     fmt::Display,
@@ -178,4 +179,33 @@ pub fn scan_files(dir: &Path) -> (Vec<ReadingListEntry>, Vec<RoundupError>) {
     }
 
     (ok, err)
+}
+
+/// Insert the entries into the database.
+/// Returns the total number of links in the database.
+pub fn insert(entries: &[ReadingListEntry], db: &Path) -> rusqlite::Result<usize> {
+    let mut db = rusqlite::Connection::open(db)?;
+    let tx = db.transaction()?;
+    let mut q = tx.prepare_cached(
+        r#"
+INSERT INTO reading_list
+        ( url,  source_date,  original_text,  body_text,  read )
+VALUES  (:url, :source_date, :original_text, :body_text, :read )
+ON CONFLICT (url) DO NOTHING;"#,
+    )?;
+    for entry in entries {
+        q.execute(named_params! {
+            ":url": entry.url.to_string(),
+            ":source_date": format!("{}", entry.source_date),
+            ":original_text": entry.original_text,
+            ":body_text": entry.body_text,
+            ":read": entry.read,
+        })?;
+    }
+    drop(q);
+    tx.commit()?;
+
+    db.query_row("SELECT COUNT(*) FROM reading_list;", params![], |v| {
+        v.get(0)
+    })
 }
