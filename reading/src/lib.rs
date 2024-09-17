@@ -1,3 +1,8 @@
+// TODO:
+// - Link at the top to the "roundups" page
+// - post handler for each roundup; save / update
+// - Javascript to auto-save?
+
 use std::{
     collections::HashMap,
     str::FromStr,
@@ -148,10 +153,10 @@ async fn update_article(
         Some(v) => v,
         None => return (StatusCode::BAD_REQUEST, "missing body_text for update").into_response(),
     };
-    // TODO:"have read" via UI as well
+    let read_state = form.get("read").map(|v| v == "read");
 
     let mut server = server.lock().unwrap();
-    match server.update_article(id, uri, body) {
+    match server.update_article(id, uri, body, read_state) {
         Ok(v) => v.into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -191,22 +196,33 @@ async fn create_roundup(
         .into_response()
 }
 
+fn nav(individual: bool) -> PreEscaped<String> {
+    let path = if individual { "../.." } else { ".." };
+    maud::html!(
+        nav { ul class="menu" {
+            li { a href=(format!("{path}/roundups/")) { "Roundups" } }
+            /* li { a href=(format!("{path}/articles/")) { "Articles" } } */
+        } }
+    )
+}
+
 impl Server {
     fn update_article(
         &mut self,
         id: isize,
         uri: Uri,
         new_body: &str,
+        read_state: Option<bool>,
     ) -> Result<impl IntoResponse, Error> {
         self.conn
             .prepare(
                 r#"
             UPDATE reading_list
-            SET body_text = :body_text
+            SET body_text = :body_text, read = :read
             WHERE id = :id
         "#,
             )?
-            .execute(named_params! {":id" : id, ":body_text" : new_body})?;
+            .execute(named_params! {":id" : id, ":body_text" : new_body, ":read": read_state})?;
         Ok((StatusCode::SEE_OTHER, [(LOCATION, uri.to_string())]))
     }
     fn render_article(
@@ -230,9 +246,13 @@ impl Server {
                 let entry = destruct_entry(row)?;
                 Ok((count, entry))
             })?;
+        let tbr = !entry.read.unwrap_or(true);
+        let read = entry.read.unwrap_or(false);
         Ok(maud::html! {
             head { link rel="stylesheet" href="/style.css"; }
-            body { main {
+            body {
+                (nav(true))
+                main {
                 div class="summary" {
                     h3 {
                         a href=(entry.url) { (entry.url) }
@@ -243,7 +263,15 @@ impl Server {
                     }
                 }
                 form action="" method="POST" {
-                    button label="Save" type="submit" { "Save" }
+                    div class="controls" {
+                        button label="Save" type="submit" { "Save" }
+                        span {
+                            input type="radio" value="tbr" id="tbr" name="read" checked?[tbr];
+                            label for="tbr" { "TBR" }
+                            input type="radio" value="read" id="tbr" name="read" checked?[read];
+                            label for="read" { "Read" }
+                        }
+                    }
                     details { summary { "Original" } pre { (entry.original_text) } }
                     details open {
                         summary { "Preview" }
@@ -268,7 +296,9 @@ impl Server {
 
         Ok(maud::html! {
             head { link rel="stylesheet" href="/style.css"; }
-            body { main {
+            body {
+                (nav(false))
+                main {
                 form method="POST" class="summary" {
                     label for="new-roundup" { "Start a new roundup: " }
                     input type="date" id="new-roundup" name="new-roundup";
@@ -315,10 +345,11 @@ impl Server {
         let excluded_rows = rows.iter().filter(|v| !v.included);
 
         fn render_row(row: &RoundupRow) -> PreEscaped<String> {
+            let unread = !row.entry.read.unwrap_or(false);
             maud::html!( tr {
                     td { (maud::PreEscaped(row.html.clone())) }
                     td { (row.count) }
-                    td { input type="checkbox" name=(format!("included-{}", row.id)) checked?[row.included] ; }
+                    td { input type="checkbox" name=(format!("included-{}", row.id)) checked?[row.included] disabled?[unread]; }
                     td { (format!("{}", row.entry.source_date)) }
                     td { a href=(format!("/articles/{}/", row.id)) { (maud::PreEscaped("&nbsp;🖉&nbsp;")) } }
                 }
@@ -328,18 +359,18 @@ impl Server {
         Ok(maud::html! {
             head { link rel="stylesheet" href="/style.css"; }
             body {
-                div class="article-meta" { h1 { "Reading Roundup" } }
+                (nav(true))
                 main {
                     div class="summary" {
-                    h3 class="tile-title" { a { (format!("Reading Roundup, {date}")) } a { "Save" } }
-                    table {
-                    @for row in included_rows { (render_row(row)) }
+                        h3 class="tile-title" { a { (format!("Reading Roundup, {date}")) } a { "Save" } }
+                        table {
+                        @for row in included_rows { (render_row(row)) }
+                        }
                     }
 
                     h3 { "Add to this roundup: " }
                     table {
                     @for row in excluded_rows { (render_row(row)) }
-                    }
                     }
                 }
             }
