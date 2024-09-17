@@ -18,8 +18,8 @@ use axum::{
     },
     response::IntoResponse,
     routing::get,
-    Form,
 };
+use axum_extra::extract::Form;
 use chrono::NaiveDate;
 use maud::PreEscaped;
 use reading_roundup_data::ReadingListEntry;
@@ -35,7 +35,7 @@ pub fn serve(db: &std::path::Path) -> Result<axum::Router, Error> {
     let conn = Connection::open(db)?;
     let s = Arc::new(Mutex::new(Server { conn }));
     Ok(axum::Router::new()
-        .route("/roundups/:date/", get(render_roundup))
+        .route("/roundups/:date/", get(render_roundup).post(update_roundup))
         .route("/roundups/", get(list_roundups).post(create_roundup))
         .route("/articles/:id/", get(render_article).post(update_article))
         .route("/style.css", get(css))
@@ -166,6 +166,38 @@ async fn update_article(
     }
 }
 
+async fn update_roundup(
+    State(server): State<Arc<Mutex<Server>>>,
+    Path(date): Path<String>,
+    OriginalUri(uri): OriginalUri,
+    Form(form): Form<HashMap<String, Vec<isize>>>,
+) -> impl IntoResponse {
+    let date: NaiveDate = match date.parse() {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "reading roundups are identified by date",
+            )
+                .into_response()
+        }
+    };
+    let articles = form
+        .get("article-included")
+        .map(Clone::clone)
+        .unwrap_or_else(Vec::new);
+
+    let mut server = server.lock().unwrap();
+    match server.update_roundup(uri, date, &articles) {
+        Ok(v) => v.into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("unexpected error: {e}"),
+        )
+            .into_response(),
+    }
+}
+
 /// Misleadingly named: an empty roundup has no data.
 /// This "just" redirects to the relevant path to edit the new roundup.
 async fn create_roundup(
@@ -207,6 +239,28 @@ fn nav(individual: bool) -> PreEscaped<String> {
 }
 
 impl Server {
+    fn update_roundup(
+        &mut self,
+        uri: Uri,
+        date: chrono::NaiveDate,
+        articles: &[isize],
+    ) -> Result<impl IntoResponse, Error> {
+        let date_str = format!("{date}");
+        // Do "remove all other entries" and "add new entries" as a single,
+        // atomic, transaction.
+        let tx = self.conn.transaction()?;
+        tx.prepare("DELETE FROM roundup_contents WHERE date = :date")?
+            .execute(named_params! {":date": &date_str})?;
+        let mut st =
+            tx.prepare("INSERT INTO roundup_contents (date, entry) VALUES (:date, :id)")?;
+        for id in articles {
+            st.execute(named_params! {":date": &date_str, ":id": id})?;
+        }
+        drop(st);
+        tx.commit()?;
+        Ok((StatusCode::SEE_OTHER, [(LOCATION, uri.to_string())]))
+    }
+
     fn update_article(
         &mut self,
         id: isize,
@@ -333,7 +387,7 @@ impl Server {
             LEFT JOIN
                 (SELECT entry as entry1, 1 as included FROM roundup_contents WHERE date = :date)
                 ON reading_list.id = entry1
-            ORDER BY included DESC, count ASC, source_date DESC
+            ORDER BY included DESC, count ASC, source_date ASC
             "#)?
             .query_map(
                 named_params! {":date": format!("{date}")},
@@ -349,7 +403,7 @@ impl Server {
             maud::html!( tr {
                     td { (maud::PreEscaped(row.html.clone())) }
                     td { (row.count) }
-                    td { input type="checkbox" name=(format!("included-{}", row.id)) checked?[row.included] disabled?[unread]; }
+                    td { input type="checkbox" name="article-included" value=(row.id) checked?[row.included] disabled?[unread]; }
                     td { (format!("{}", row.entry.source_date)) }
                     td { a href=(format!("/articles/{}/", row.id)) { (maud::PreEscaped("&nbsp;🖉&nbsp;")) } }
                 }
@@ -360,11 +414,15 @@ impl Server {
             head { link rel="stylesheet" href="/style.css"; }
             body {
                 (nav(true))
-                main {
+                main { form method="POST" {
                     div class="summary" {
-                        h3 class="tile-title" { a { (format!("Reading Roundup, {date}")) } a { "Save" } }
+                        h3 class="tile-title" {
+                            a { (format!("Reading Roundup, {date}")) }
+                            button label="Save" type="submit" { "Save" }
+                         }
+
                         table {
-                        @for row in included_rows { (render_row(row)) }
+                            @for row in included_rows { (render_row(row)) }
                         }
                     }
 
@@ -372,7 +430,7 @@ impl Server {
                     table {
                     @for row in excluded_rows { (render_row(row)) }
                     }
-                }
+                } }
             }
         })
     }
