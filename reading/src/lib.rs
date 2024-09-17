@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    str::FromStr,
     sync::{Arc, Mutex},
 };
 
@@ -7,6 +8,7 @@ use axum::{
     extract::{OriginalUri, Path, State},
     http::{
         header::{CONTENT_TYPE, LOCATION},
+        uri::PathAndQuery,
         StatusCode, Uri,
     },
     response::IntoResponse,
@@ -14,6 +16,7 @@ use axum::{
     Form,
 };
 use chrono::NaiveDate;
+use maud::PreEscaped;
 use reading_roundup_data::ReadingListEntry;
 use rusqlite::{named_params, Connection};
 
@@ -28,7 +31,7 @@ pub fn serve(db: &std::path::Path) -> Result<axum::Router, Error> {
     let s = Arc::new(Mutex::new(Server { conn }));
     Ok(axum::Router::new()
         .route("/roundups/:date/", get(render_roundup))
-        .route("/roundups/", get(list_roundups))
+        .route("/roundups/", get(list_roundups).post(create_roundup))
         .route("/articles/:id/", get(render_article).post(update_article))
         .route("/style.css", get(css))
         .with_state(s))
@@ -41,6 +44,7 @@ struct Server {
 struct RoundupRow {
     id: isize,
     included: bool,
+    count: isize,
     html: String,
     entry: ReadingListEntry,
 }
@@ -48,9 +52,11 @@ struct RoundupRow {
 fn destruct_roundup_row(row: &rusqlite::Row) -> rusqlite::Result<RoundupRow> {
     let html = markdown::to_html(&row.get::<_, String>("body_text")?);
     let included = row.get::<_, Option<bool>>("included")?.unwrap_or(false);
+    let count = row.get::<_, Option<isize>>("count")?.unwrap_or(0);
     Ok(RoundupRow {
         id: row.get("id")?,
         included,
+        count,
         html,
         entry: destruct_entry(row)?,
     })
@@ -153,6 +159,36 @@ async fn update_article(
         )
             .into_response(),
     }
+}
+
+/// Misleadingly named: an empty roundup has no data.
+/// This "just" redirects to the relevant path to edit the new roundup.
+async fn create_roundup(
+    OriginalUri(uri): OriginalUri,
+    Form(form): Form<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let date: NaiveDate = match form
+        .get("new-roundup")
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "missing new-roundup date").into_response())
+        .and_then(|s| {
+            s.parse().map_err(|_| {
+                (StatusCode::BAD_REQUEST, "invalid date for new roundup").into_response()
+            })
+        }) {
+        Ok(v) => v,
+        Err(e) => return e.into_response(),
+    };
+    let mut origin = uri.into_parts();
+    origin.path_and_query = Some(match origin.path_and_query {
+        None => PathAndQuery::from_str(&format!("{date}/")).unwrap(),
+        Some(pq) => PathAndQuery::from_str(&(pq.path().to_owned() + &format!("{date}/"))).unwrap(),
+    });
+
+    (
+        StatusCode::SEE_OTHER,
+        [(LOCATION, Uri::from_parts(origin).unwrap().to_string())],
+    )
+        .into_response()
 }
 
 impl Server {
@@ -262,11 +298,13 @@ impl Server {
             SELECT *
             FROM reading_list
             LEFT JOIN
-                (SELECT entry, 1 as included FROM roundup_contents WHERE date = :date)
-                ON reading_list.id = entry
-            ORDER BY included DESC, source_date DESC
-            "#,
-            )?
+                (SELECT entry as entry2, COUNT(DISTINCT date) as count FROM roundup_contents GROUP BY entry2)
+                ON reading_list.id = entry2
+            LEFT JOIN
+                (SELECT entry as entry1, 1 as included FROM roundup_contents WHERE date = :date)
+                ON reading_list.id = entry1
+            ORDER BY included DESC, count ASC, source_date DESC
+            "#)?
             .query_map(
                 named_params! {":date": format!("{date}")},
                 destruct_roundup_row,
@@ -276,29 +314,33 @@ impl Server {
         let included_rows = rows.iter().filter(|v| v.included);
         let excluded_rows = rows.iter().filter(|v| !v.included);
 
+        fn render_row(row: &RoundupRow) -> PreEscaped<String> {
+            maud::html!( tr {
+                    td { (maud::PreEscaped(row.html.clone())) }
+                    td { (row.count) }
+                    td { input type="checkbox" name=(format!("included-{}", row.id)) checked?[row.included] ; }
+                    td { (format!("{}", row.entry.source_date)) }
+                    td { a href=(format!("/articles/{}/", row.id)) { (maud::PreEscaped("&nbsp;🖉&nbsp;")) } }
+                }
+            )
+        }
+
         Ok(maud::html! {
             head { link rel="stylesheet" href="/style.css"; }
             body {
                 div class="article-meta" { h1 { "Reading Roundup" } }
                 main {
                     div class="summary" {
-                        h3 class="tile-title" { a { (format!("Reading Roundup, {date}")) } a { "Save" } }
+                    h3 class="tile-title" { a { (format!("Reading Roundup, {date}")) } a { "Save" } }
                     table {
-                    @for row in included_rows { tr {
-                        td { (maud::PreEscaped(row.html.clone())) }
-                        td { input type="checkbox" name=(format!("included-{}", row.id)) checked?[row.included] ; }
-                        td { (format!("{}", row.entry.source_date)) }
-                        td { a href=(format!("/articles/{}/", row.id)) { (maud::PreEscaped("&nbsp;🖉&nbsp;")) } }
-                    } }
-                    } }
+                    @for row in included_rows { (render_row(row)) }
+                    }
 
                     h3 { "Add to this roundup: " }
-                    table { @for row in excluded_rows { tr {
-                        td { input type="checkbox" name=(format!("included-{}", row.id)) checked?[row.included] ; }
-                        td { (format!("{}", row.entry.source_date)) }
-                        td { a href=(format!("/articles/{}/", row.id)) { (maud::PreEscaped("&nbsp;🖉&nbsp;")) } }
-                        td { (maud::PreEscaped(row.html.clone())) }
-                    } } }
+                    table {
+                    @for row in excluded_rows { (render_row(row)) }
+                    }
+                    }
                 }
             }
         })
