@@ -1,0 +1,15 @@
+[package]
+name = "roundup"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.89"
+chrono = { version = "0.4.38", default-features = false }
+http = "1.1.0"
+markdown = "1.0.0-alpha.20"
+regex-lite = "0.1.6"
+rusqlite = "0.32.1"
+thiserror = "1.0.63"
+tracing = "0.1.40"
+tracing-subscriber = "0.3.18"
