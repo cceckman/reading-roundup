@@ -1,0 +1,47 @@
+@import "https://cceckman.com/css/style.css";
+
+textarea {
+    width: 100%;
+    height: 100pt;
+    max-width: 100%;
+    min-width: 100%;
+
+    font-size: larger;
+    background-color: var(--codebg-color);
+    color: var(--text-color);
+}
+
+textarea.narrow {
+    min-width: 50%;
+    height: 100pt;
+    max-width: 100%;
+
+    font-size: larger;
+    background-color: var(--codebg-color);
+    color: var(--text-color);
+}
+
+input {
+    font-size: larger;
+    background-color: var(--codebg-color);
+    color: var(--text-color);
+}
+
+.tile-title {
+    display: flex;
+    justify-content: space-between;
+}
+
+pre {
+    white-space: pre-wrap;
+    word-wrap: break-word;
+}
+
+.controls {
+    display: flex;
+    justify-content: space-between;
+
+    padding: calc(2 * var(--border-radius));
+    background-color: var(--textbg-color-alt);
+    color: var(--text-color);
+}

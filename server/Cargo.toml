@@ -1,0 +1,16 @@
+[package]
+name = "server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = { version = "0.7.5", default-features = false, features = ["http1", "http2", "tokio"] }
+clap = { version = "4.5.13", features = ["derive"] }
+hyper = "1.4.1"
+hyper-util = "0.1.8"
+listenfd = "1.0.1"
+reading = { version = "0.1.0", path = "../reading" }
+tokio = { version = "1.40.0", features = ["rt-multi-thread"] }
+tower = { version = "0.5.1", features = ["make"] }
+tracing = "0.1.40"
+tracing-subscriber = "0.3.18"
